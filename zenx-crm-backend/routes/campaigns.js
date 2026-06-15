@@ -82,12 +82,12 @@ router.post('/:id/send', async (req, res) => {
   const { id: campaignId } = req.params;
 
   try {
-    // Fetch campaign with its segment and first variant
+    // Fetch campaign with its segment (including sql_query) and first variant
     const { data: campaign, error: campaignError } = await supabase
       .from('campaigns')
       .select(`
         *,
-        segments ( id ),
+        segments ( id, sql_query ),
         campaign_variants ( id, message_template )
       `)
       .eq('id', campaignId)
@@ -99,16 +99,73 @@ router.post('/:id/send', async (req, res) => {
     const variant = campaign.campaign_variants?.[0];
     if (!variant) return res.status(400).json({ error: 'No variant found for this campaign.' });
 
-    // Fetch all profiles in the segment via the segment's sql_query result
-    // Segments store a sql_query; we use customer_profiles as the base audience.
-    // For MVP we pull all profiles and use identity matching for the channel.
-    const { data: profiles, error: profilesError } = await supabase
+    // ── Resolve audience from segment filter ─────────────────────────────────
+    let targetProfileIds = null; // null means no filter → send to all (fallback)
+
+    const rawFilter = campaign.segments?.sql_query;
+    if (rawFilter) {
+      // sql_query stores the JSON filter array as a string
+      let filters;
+      try {
+        filters = typeof rawFilter === 'string' ? JSON.parse(rawFilter) : rawFilter;
+      } catch {
+        filters = null;
+      }
+
+      if (Array.isArray(filters) && filters.length > 0) {
+        // Fetch all customer_attributes and apply the same AND-filter logic as ai.js
+        const { data: allAttributes, error: attrError } = await supabase
+          .from('customer_attributes')
+          .select('profile_id, key, value');
+
+        if (attrError) throw attrError;
+
+        // Group attributes by profile_id
+        const profileMap = {};
+        for (const attr of allAttributes) {
+          if (!profileMap[attr.profile_id]) profileMap[attr.profile_id] = {};
+          profileMap[attr.profile_id][attr.key] = attr.value;
+        }
+
+        // Apply filters (AND logic — same as ai.js)
+        targetProfileIds = Object.entries(profileMap)
+          .filter(([, attrs]) =>
+            filters.every((f) => {
+              const val = attrs[f.key];
+              if (val === undefined || val === null) return false;
+              switch (f.operator) {
+                case 'eq':       return val.toLowerCase() === String(f.value).toLowerCase();
+                case 'gt':       return parseFloat(val) > parseFloat(f.value);
+                case 'lt':       return parseFloat(val) < parseFloat(f.value);
+                case 'contains': return val.toLowerCase().includes(String(f.value).toLowerCase());
+                default:         return false;
+              }
+            })
+          )
+          .map(([id]) => id);
+
+        if (targetProfileIds.length === 0) {
+          // Segment matches nobody — mark completed with 0 dispatched
+          await supabase.from('campaigns').update({ status: 'completed' }).eq('id', campaignId);
+          return res.json({ campaign_id: campaignId, dispatched: 0, results: [] });
+        }
+      }
+    }
+
+    // ── Fetch profiles (optionally scoped to segment IDs) ───────────────────
+    let profileQuery = supabase
       .from('customer_profiles')
       .select(`
         id,
-        customer_identities ( channel, value, is_primary, opted_in )
+        customer_identities ( channel, value, is_primary, opted_in ),
+        customer_attributes ( key, value )
       `);
 
+    if (targetProfileIds) {
+      profileQuery = profileQuery.in('id', targetProfileIds);
+    }
+
+    const { data: profiles, error: profilesError } = await profileQuery;
     if (profilesError) throw profilesError;
 
     // Mark campaign as sending
@@ -127,6 +184,13 @@ router.post('/:id/send', async (req, res) => {
 
       if (!identity) continue; // skip profiles without a valid identity for this channel
 
+      // Resolve customer name for personalization
+      const nameAttr = profile.customer_attributes?.find((a) => a.key === 'name');
+      const customerName = nameAttr?.value || 'Valued Customer';
+
+      // Personalize the message
+      const personalizedMessage = (variant.message_template || '').replace(/\{name\}/gi, customerName);
+
       // Insert campaign_send record
       const { data: send, error: sendError } = await supabase
         .from('campaign_sends')
@@ -135,7 +199,7 @@ router.post('/:id/send', async (req, res) => {
           variant_id: variant.id,
           profile_id: profile.id,
           channel_address: identity.value,
-          message_sent: variant.message_template,
+          message_sent: personalizedMessage,
           status: 'pending',
         })
         .select()
@@ -151,7 +215,7 @@ router.post('/:id/send', async (req, res) => {
         await axios.post(DELIVERY_SERVICE_URL, {
           send_id: send.id,
           recipient: identity.value,
-          message: variant.message_template,
+          message: personalizedMessage,
           channel: campaign.channel,
           callback_url: `${CALLBACK_BASE_URL}/api/receipts`,
         });
@@ -175,6 +239,7 @@ router.post('/:id/send', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // GET /campaigns/:id/stats — fetch campaign_stats for a campaign
 router.get('/:id/stats', async (req, res) => {
