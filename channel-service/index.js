@@ -213,9 +213,10 @@ app.post('/send', (req, res) => {
   simulateSend({ send_id, recipient, message, channel, callback_url });
 });
 
+
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Channel service running on port ${PORT}`);
   // Warm up the Gmail transporter on startup
