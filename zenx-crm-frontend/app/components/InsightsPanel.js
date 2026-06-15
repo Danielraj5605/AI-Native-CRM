@@ -4,7 +4,7 @@
 import { useState, useEffect } from 'react';
 import { Skeleton, SkeletonText } from './Skeleton';
 
-const API = 'http://localhost:3001';
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 const LEVEL_COLOR = {
   high:   'var(--danger)',

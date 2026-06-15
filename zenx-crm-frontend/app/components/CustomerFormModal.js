@@ -6,7 +6,7 @@ import LoadingSpinner from './LoadingSpinner';
 import { getAttr, getIdentity } from '../lib/helpers';
 import { useDebounce } from '../hooks/useDebounce';
 
-const API = 'http://localhost:3001';
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 const TIERS = ['new', 'regular', 'vip', 'lapsed'];
 
 const labelStyle = {

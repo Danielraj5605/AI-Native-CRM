@@ -11,7 +11,7 @@ import DonutChart from './components/charts/DonutChart';
 import CampaignBarChart from './components/charts/CampaignBarChart';
 import InsightsPanel from './components/InsightsPanel';
 
-const API = 'http://localhost:3001';
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 const fetcher = (url) => fetch(url).then((r) => {
   if (!r.ok) throw new Error(`Server error ${r.status}`);

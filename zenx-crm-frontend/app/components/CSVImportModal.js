@@ -4,7 +4,7 @@
 import { useState, useRef } from 'react';
 import LoadingSpinner from './LoadingSpinner';
 
-const API = 'http://localhost:3001';
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 const EXPECTED_COLUMNS = ['name', 'email', 'whatsapp', 'city', 'loyalty_tier', 'total_spent', 'last_order_days_ago'];
 

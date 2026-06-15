@@ -13,7 +13,7 @@ import { getAttr, getIdentity, formatCurrency } from '../lib/helpers';
 import { useDebounce } from '../hooks/useDebounce';
 import { useToast } from '../context/ToastContext';
 
-const API = 'http://localhost:3001';
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 const fetcher = (url) => fetch(url).then((r) => {
   if (!r.ok) throw new Error(`Server error ${r.status}`);
   return r.json();
