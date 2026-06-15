@@ -1,33 +1,27 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
 const app = express();
 app.use(express.json());
 
-// ─── Gmail Transporter ────────────────────────────────────────────────────────
+// ─── Resend Client ────────────────────────────────────────────────────────────
 
-let gmailTransporter = null;
+let resendClient = null;
 
-function getGmailTransporter() {
-  if (gmailTransporter) return gmailTransporter;
+function getResendClient() {
+  if (resendClient) return resendClient;
 
-  const user = process.env.GMAIL_USER;
-  const pass = process.env.GMAIL_APP_PASS;
-
-  if (!user || !pass || user.includes('your-gmail')) {
-    console.warn('[EMAIL] GMAIL_USER / GMAIL_APP_PASS not set — email channel will simulate only.');
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey || apiKey.includes('your-resend')) {
+    console.warn('[EMAIL] RESEND_API_KEY not set — email channel will simulate only.');
     return null;
   }
 
-  gmailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user, pass },
-  });
-
-  console.log(`[EMAIL] Gmail transporter ready for ${user}`);
-  return gmailTransporter;
+  resendClient = new Resend(apiKey);
+  console.log('[EMAIL] Resend client ready (HTTP API — no SMTP port issues)');
+  return resendClient;
 }
 
 // ─── Email HTML Template ──────────────────────────────────────────────────────
@@ -121,38 +115,42 @@ async function fireCallback(callbackUrl, payload) {
 // ─── Email Send ───────────────────────────────────────────────────────────────
 
 async function sendRealEmail({ send_id, recipient, message, callback_url }) {
-  const transporter = getGmailTransporter();
+  const client = getResendClient();
 
-  if (!transporter) {
-    // Fall back to simulation if Gmail is not configured
-    console.warn(`[EMAIL SIM   ] send_id=${send_id} Gmail not configured — simulating`);
+  if (!client) {
+    // Fall back to simulation if Resend is not configured
+    console.warn(`[EMAIL SIM   ] send_id=${send_id} Resend not configured — simulating`);
     return simulateDelivery({ send_id, callback_url });
   }
 
   console.log(`[EMAIL SEND  ] send_id=${send_id} → ${recipient}`);
 
   try {
-    await transporter.sendMail({
-      from: `"ZenX CRM" <${process.env.GMAIL_USER}>`,
+    const fromAddress = process.env.RESEND_FROM || 'ZenX CRM <onboarding@resend.dev>';
+    const { data, error } = await client.emails.send({
+      from: fromAddress,
       to: recipient,
       subject: '✨ A message from ZenX — Just for you',
       text: message,
       html: buildEmailHtml(message),
     });
 
-    console.log(`[EMAIL OK    ] send_id=${send_id} → ${recipient}`);
-    await fireCallback(callback_url, { campaign_send_id: send_id, event_type: 'delivered', metadata: { via: 'gmail' } });
+    if (error) throw new Error(error.message || JSON.stringify(error));
 
-    // Simulate open after short delay (real opens tracked by pixel — simplified here)
+    console.log(`[EMAIL OK    ] send_id=${send_id} → ${recipient} (id: ${data?.id})`);
+    await fireCallback(callback_url, { campaign_send_id: send_id, event_type: 'delivered', metadata: { via: 'resend', resend_id: data?.id } });
+
+    // Simulate open after short delay
     setTimeout(async () => {
       await fireCallback(callback_url, { campaign_send_id: send_id, event_type: 'opened', metadata: {} });
-    }, randomBetween(3000, 8000));
+    }, Math.floor(Math.random() * 5000) + 3000);
 
   } catch (err) {
     console.error(`[EMAIL FAIL  ] send_id=${send_id} → ${err.message}`);
     await fireCallback(callback_url, { campaign_send_id: send_id, event_type: 'failed', metadata: { error: err.message } });
   }
 }
+
 
 // ─── Simulation chain (WhatsApp / SMS / RCS) ─────────────────────────────────
 
@@ -219,6 +217,6 @@ app.post('/send', (req, res) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Channel service running on port ${PORT}`);
-  // Warm up the Gmail transporter on startup
-  getGmailTransporter();
+  // Warm up the Resend client on startup
+  getResendClient();
 });
