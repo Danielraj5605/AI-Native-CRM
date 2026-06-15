@@ -3,7 +3,7 @@ const router = express.Router();
 const axios = require('axios');
 const supabase = require('../services/supabase');
 
-const DELIVERY_SERVICE_URL = 'http://localhost:4000/send';
+const DELIVERY_SERVICE_URL = `${process.env.CHANNEL_SERVICE_URL || 'http://localhost:4000'}/send`;
 const CALLBACK_BASE_URL = process.env.CALLBACK_BASE_URL || 'http://localhost:3001';
 // GET /campaigns — all campaigns with campaign_stats and segment name
 router.get('/', async (req, res) => {
