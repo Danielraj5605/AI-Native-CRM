@@ -80,6 +80,8 @@ router.post('/', async (req, res) => {
 // POST /campaigns/:id/send — dispatch campaign to every customer in the segment
 router.post('/:id/send', async (req, res) => {
   const { id: campaignId } = req.params;
+  console.log(`[SEND] Campaign ${campaignId} send triggered`);
+  console.log(`[SEND] DELIVERY_SERVICE_URL = ${DELIVERY_SERVICE_URL}`);
 
   try {
     // Fetch campaign with its segment (including sql_query) and first variant
@@ -96,6 +98,8 @@ router.post('/:id/send', async (req, res) => {
     if (campaignError) throw campaignError;
     if (!campaign) return res.status(404).json({ error: 'Campaign not found.' });
 
+    console.log(`[SEND] Campaign channel: ${campaign.channel}`);
+
     const variant = campaign.campaign_variants?.[0];
     if (!variant) return res.status(400).json({ error: 'No variant found for this campaign.' });
 
@@ -104,7 +108,6 @@ router.post('/:id/send', async (req, res) => {
 
     const rawFilter = campaign.segments?.sql_query;
     if (rawFilter) {
-      // sql_query stores the JSON filter array as a string
       let filters;
       try {
         filters = typeof rawFilter === 'string' ? JSON.parse(rawFilter) : rawFilter;
@@ -113,21 +116,19 @@ router.post('/:id/send', async (req, res) => {
       }
 
       if (Array.isArray(filters) && filters.length > 0) {
-        // Fetch all customer_attributes and apply the same AND-filter logic as ai.js
+        console.log(`[SEND] Applying segment filters:`, JSON.stringify(filters));
         const { data: allAttributes, error: attrError } = await supabase
           .from('customer_attributes')
           .select('profile_id, key, value');
 
         if (attrError) throw attrError;
 
-        // Group attributes by profile_id
         const profileMap = {};
         for (const attr of allAttributes) {
           if (!profileMap[attr.profile_id]) profileMap[attr.profile_id] = {};
           profileMap[attr.profile_id][attr.key] = attr.value;
         }
 
-        // Apply filters (AND logic — same as ai.js)
         targetProfileIds = Object.entries(profileMap)
           .filter(([, attrs]) =>
             filters.every((f) => {
@@ -144,15 +145,16 @@ router.post('/:id/send', async (req, res) => {
           )
           .map(([id]) => id);
 
+        console.log(`[SEND] Segment matched ${targetProfileIds.length} profiles`);
+
         if (targetProfileIds.length === 0) {
-          // Segment matches nobody — mark completed with 0 dispatched
           await supabase.from('campaigns').update({ status: 'completed' }).eq('id', campaignId);
           return res.json({ campaign_id: campaignId, dispatched: 0, results: [] });
         }
       }
     }
 
-    // ── Fetch profiles (optionally scoped to segment IDs) ───────────────────
+    // ── Fetch profiles ───────────────────────────────────────────────────────
     let profileQuery = supabase
       .from('customer_profiles')
       .select(`
@@ -168,30 +170,33 @@ router.post('/:id/send', async (req, res) => {
     const { data: profiles, error: profilesError } = await profileQuery;
     if (profilesError) throw profilesError;
 
+    console.log(`[SEND] Fetched ${profiles.length} profiles`);
+
     // Mark campaign as sending
     await supabase
       .from('campaigns')
       .update({ status: 'sending', sent_at: new Date().toISOString() })
       .eq('id', campaignId);
 
-    const results = [];
+    // ── Build send records ───────────────────────────────────────────────────
+    const sendRecords = [];
 
     for (const profile of profiles) {
-      // Find the matching channel identity for this campaign's channel
+      // Find channel identity — allow opted_in=null (not explicitly opted out)
+      // Only skip if opted_in is explicitly false
       const identity = profile.customer_identities?.find(
-        (i) => i.channel === campaign.channel && i.opted_in
+        (i) => i.channel === campaign.channel && i.opted_in !== false
       );
 
-      if (!identity) continue; // skip profiles without a valid identity for this channel
+      if (!identity) {
+        console.log(`[SEND] Profile ${profile.id} skipped — no ${campaign.channel} identity (or explicitly opted out)`);
+        continue;
+      }
 
-      // Resolve customer name for personalization
       const nameAttr = profile.customer_attributes?.find((a) => a.key === 'name');
       const customerName = nameAttr?.value || 'Valued Customer';
-
-      // Personalize the message
       const personalizedMessage = (variant.message_template || '').replace(/\{name\}/gi, customerName);
 
-      // Insert campaign_send record
       const { data: send, error: sendError } = await supabase
         .from('campaign_sends')
         .insert({
@@ -206,39 +211,42 @@ router.post('/:id/send', async (req, res) => {
         .single();
 
       if (sendError) {
-        console.error(`campaign_send insert error for profile ${profile.id}:`, sendError.message);
+        console.error(`[SEND] campaign_send insert error for profile ${profile.id}:`, sendError.message);
         continue;
       }
 
-      // Dispatch to delivery service (fire-and-forget per send)
-      try {
-        await axios.post(DELIVERY_SERVICE_URL, {
-          send_id: send.id,
-          recipient: identity.value,
-          message: personalizedMessage,
-          channel: campaign.channel,
-          callback_url: `${CALLBACK_BASE_URL}/api/receipts`,
-        });
-
-        results.push({ send_id: send.id, status: 'dispatched' });
-      } catch (dispatchErr) {
-        console.error(`Dispatch error for send ${send.id}:`, dispatchErr.message);
-        results.push({ send_id: send.id, status: 'dispatch_failed', error: dispatchErr.message });
-      }
+      sendRecords.push({ send, identity, personalizedMessage });
     }
 
-    // Mark campaign as completed
-    await supabase
-      .from('campaigns')
-      .update({ status: 'completed' })
-      .eq('id', campaignId);
+    console.log(`[SEND] ${sendRecords.length} send records created, dispatching now...`);
 
-    res.json({ campaign_id: campaignId, dispatched: results.length, results });
+    // ── Mark completed & respond immediately (fire-and-forget dispatch) ──────
+    await supabase.from('campaigns').update({ status: 'completed' }).eq('id', campaignId);
+    res.json({ campaign_id: campaignId, dispatched: sendRecords.length, results: sendRecords.map(r => ({ send_id: r.send.id, status: 'queued' })) });
+
+    // ── Dispatch to channel service in background (non-blocking) ─────────────
+    for (const { send, identity, personalizedMessage } of sendRecords) {
+      const payload = {
+        send_id: send.id,
+        recipient: identity.value,
+        message: personalizedMessage,
+        channel: campaign.channel,
+        callback_url: `${CALLBACK_BASE_URL}/api/receipts`,
+      };
+      console.log(`[SEND] Dispatching send_id=${send.id} to ${identity.value} via ${campaign.channel}`);
+      axios.post(DELIVERY_SERVICE_URL, payload, { timeout: 30000 })
+        .then(() => console.log(`[SEND] Dispatch OK send_id=${send.id}`))
+        .catch((err) => console.error(`[SEND] Dispatch FAIL send_id=${send.id}: ${err.message}`));
+    }
+
   } catch (err) {
-    console.error(`POST /campaigns/${campaignId}/send error:`, err.message);
-    res.status(500).json({ error: err.message });
+    console.error(`[SEND] POST /campaigns/${campaignId}/send error:`, err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
+
 
 
 // GET /campaigns/:id/stats — fetch campaign_stats for a campaign
